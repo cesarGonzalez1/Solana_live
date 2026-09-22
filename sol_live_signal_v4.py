@@ -1,23 +1,22 @@
 """
-SOL Swing - Señal en Vivo v3
+SOL Swing - Señal en Vivo v4
 =============================
-Agrega sobre v2:
-- Deteccion de volumen anomalo (posible catalizador/noticia) -> avisa revisar
-  manualmente, el script NO lee noticias, solo detecta la anomalia en precio/volumen.
-- Si el precio toca el target (VAH) pero el setup sigue tecnicamente fuerte
-  (bias intacto, RSI no extremo, volumen sostenido), sugiere DEJAR CORRER
-  con nuevo stop (breakeven+) y siguiente resistencia (HVN mas amplio),
-  en vez de forzar salida solo porque tocó el primer target.
+Agrega sobre v3:
+- VWAP del dia (calculado con velas 1h desde las 00:00 UTC) como filtro de
+  PRECISION de entrada. El setup diario (bias+RSI+HVN) sigue siendo el que
+  decide SI hay operacion. El VWAP solo dice CUANDO dentro del dia conviene
+  ejecutar -- precio favorable = igual o debajo del VWAP de hoy.
 
-Guarda igual: sol_position_state.json, sol_trade_log.csv
+Todo lo demas igual que v3: estado persistente, deteccion de volumen
+anomalo, logica de extension de target.
 
-Uso: python3 sol_live_signal_v3.py
+Uso: python3 sol_live_signal_v4.py
 """
 
 import json
 import os
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 
 import requests
 import pandas as pd
@@ -25,15 +24,16 @@ import numpy as np
 
 SYMBOL = "SOLUSDT"
 INTERVAL = "1d"
+INTRADAY_INTERVAL = "1h"     # para calcular el VWAP del dia en curso
 BASE_URL = "https://api.binance.com/api/v3/klines"
 
 VP_WINDOW = 90
-VP_WINDOW_EXT = 180          # ventana ancha para buscar la SIGUIENTE resistencia tras el primer target
+VP_WINDOW_EXT = 180
 RSI_LEN = 14
 RSI_ENTRY_LOW = 45
 RSI_ENTRY_HIGH = 60
 RSI_EXIT_OVERBOUGHT = 75
-RSI_EXTENSION_MAX = 80       # arriba de esto, ya no se sugiere extender aunque lo demas se vea bien
+RSI_EXTENSION_MAX = 80
 STOP_PCT = 0.06
 HVN_PROXIMITY_PCT = 0.015
 EMA_FAST = 50
@@ -41,16 +41,17 @@ EMA_SLOW = 200
 VP_BINS = 24
 LOOKBACK_DAYS = 400
 VOL_AVG_WINDOW = 20
-VOL_SPIKE_RATIO = 1.5        # volumen hoy >= 1.5x promedio 20d = anomalia
+VOL_SPIKE_RATIO = 1.5
+VWAP_TOLERANCE_PCT = 0.003   # 0.3% de margen sobre el VWAP para considerarlo "favorable"
 
 STATE_FILE = "sol_position_state.json"
 LOG_FILE = "sol_trade_log.csv"
 
 
 # -------------------- DATOS / INDICADORES --------------------
-def fetch_klines(symbol=SYMBOL, interval=INTERVAL, days=LOOKBACK_DAYS):
+def fetch_klines(symbol=SYMBOL, interval=INTERVAL, days=LOOKBACK_DAYS, start_ms=None):
     end_time = int(time.time() * 1000)
-    start_time = end_time - days * 24 * 60 * 60 * 1000
+    start_time = start_ms if start_ms is not None else end_time - days * 24 * 60 * 60 * 1000
     all_rows = []
     while start_time < end_time:
         params = {"symbol": symbol, "interval": interval, "startTime": start_time, "limit": 1000}
@@ -137,10 +138,23 @@ def near_any(price, levels, pct=HVN_PROXIMITY_PCT):
 
 
 def find_next_resistance(df, current_price, window=VP_WINDOW_EXT):
-    """Busca el HVN mas cercano POR ARRIBA del precio actual, usando ventana mas ancha."""
     _, _, _, hvns = compute_volume_profile(df.iloc[-window:])
     above = sorted([h for h in hvns if h > current_price * 1.01])
     return above[0] if above else None
+
+
+def compute_today_vwap():
+    """VWAP de la sesion UTC actual, usando velas 1h desde las 00:00 UTC de hoy."""
+    now_utc = datetime.now(timezone.utc)
+    start_of_day = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
+    start_ms = int(start_of_day.timestamp() * 1000)
+
+    intraday = fetch_klines(interval=INTRADAY_INTERVAL, start_ms=start_ms)
+    if intraday.empty:
+        return None
+    typical_price = (intraday["high"] + intraday["low"] + intraday["close"]) / 3
+    vwap = (typical_price * intraday["volume"]).sum() / intraday["volume"].sum()
+    return vwap
 
 
 # -------------------- ESTADO --------------------
@@ -217,11 +231,21 @@ def check_new_setup(df, poc, vah, val, hvns):
     print(f"Precio: {price:.2f} | EMA50/200: {last['ema_fast']:.2f}/{last['ema_slow']:.2f} | RSI: {last['rsi']:.2f}")
     print(f"POC/VAH/VAL: {poc:.2f}/{vah:.2f}/{val:.2f}")
     print(f"Bias:{'SI' if bias_ok else 'NO'}  RSI-zona:{'SI' if rsi_reset else 'NO'}  Cerca-HVN:{'SI' if near_hvn else 'NO'}")
+
+    print("Calculando VWAP del día en curso...")
+    vwap = compute_today_vwap()
+    vwap_favorable = None
+    if vwap is not None:
+        vwap_favorable = price <= vwap * (1 + VWAP_TOLERANCE_PCT)
+        print(f"VWAP hoy: {vwap:.2f} | Precio vs VWAP: {(price-vwap)/vwap*100:+.2f}%  ({'favorable' if vwap_favorable else 'por arriba, esperar pullback'})")
+    else:
+        print("No se pudo calcular VWAP de hoy (sin velas intradía aún).")
+
     print("="*55)
 
     anomaly = check_volume_anomaly(df)
     if anomaly:
-        print(f"⚠ VOLUMEN ANOMALO: hoy {anomaly:.1f}x el promedio 20d — posible catalizador/noticia. Revisa manualmente (Binance news, CoinDesk, X).")
+        print(f"⚠ VOLUMEN ANOMALO: hoy {anomaly:.1f}x el promedio 20d — posible catalizador/noticia. Revisa manualmente.")
 
     if not setup_active:
         faltantes = [n for cond, n in [(bias_ok,"bias alcista"),(rsi_reset,"RSI 45-60"),(near_hvn,"cerca HVN/POC")] if not cond]
@@ -229,21 +253,31 @@ def check_new_setup(df, poc, vah, val, hvns):
         return
 
     stop_level = poc * (1 - STOP_PCT)
-    print(">>> SETUP ACTIVO <<<")
+    print(">>> SETUP DIARIO ACTIVO <<<")
     print(f"Entrada ref: {price:.2f} | Stop: {stop_level:.2f} | Target: {vah:.2f}")
 
-    if ask_yes_no("\n¿Entraste?"):
-        entry_price = ask_float(f"Precio de entrada (Enter={price:.2f}): ", default=price)
-        state = {
-            "in_position": True, "entry_date": last["open_time"].strftime("%Y-%m-%d"),
-            "entry_price": entry_price, "poc_at_entry": poc,
-            "stop_level": poc * (1 - STOP_PCT), "target_vah": vah,
-            "extended": False,
-        }
-        save_state(state)
-        print(f"\nGuardado. Stop:{state['stop_level']:.2f} Target:{state['target_vah']:.2f}")
+    if vwap_favorable is False:
+        print("\n⚠ Setup diario cumple condiciones, pero precio está por ARRIBA del VWAP de hoy.")
+        print("  Recomendación: esperar pullback intradía hacia el VWAP antes de entrar,")
+        print("  en vez de comprar el precio ya estirado del día. Puedes volver a correr")
+        print("  el script más tarde el mismo día para revisar si el VWAP se alcanzó.")
+        if not ask_yes_no("\n¿De todos modos quieres registrar una entrada ahora?"):
+            print("\nOk, no se guardó nada. Vuelve a correr más tarde.")
+            return
     else:
-        print("\nOk, no se guardó nada.")
+        if not ask_yes_no("\n¿Entraste?"):
+            print("\nOk, no se guardó nada.")
+            return
+
+    entry_price = ask_float(f"Precio de entrada (Enter={price:.2f}): ", default=price)
+    state = {
+        "in_position": True, "entry_date": last["open_time"].strftime("%Y-%m-%d"),
+        "entry_price": entry_price, "poc_at_entry": poc,
+        "stop_level": poc * (1 - STOP_PCT), "target_vah": vah,
+        "extended": False,
+    }
+    save_state(state)
+    print(f"\nGuardado. Stop:{state['stop_level']:.2f} Target:{state['target_vah']:.2f}")
 
 
 # -------------------- FLUJO POSICION ABIERTA --------------------
@@ -278,11 +312,10 @@ def evaluate_open_position(state, df):
 
     anomaly = check_volume_anomaly(df)
     if anomaly:
-        print(f"⚠ VOLUMEN ANOMALO: {anomaly:.1f}x promedio 20d — algo esta moviendo el precio fuera de lo normal. Revisa noticias manualmente antes de decidir.")
+        print(f"⚠ VOLUMEN ANOMALO: {anomaly:.1f}x promedio 20d — revisa noticias manualmente.")
 
     print("-"*55)
 
-    # --- Caso: tocó target pero setup sigue fuerte -> evaluar extension ---
     if target_hit and not stop_hit:
         bias_ok = last["ema_fast"] > last["ema_slow"]
         rsi_ok_extend = last["rsi"] < RSI_EXTENSION_MAX
@@ -290,28 +323,22 @@ def evaluate_open_position(state, df):
 
         if bias_ok and rsi_ok_extend:
             next_target = find_next_resistance(df, price)
-            new_stop = max(stop_level, entry_price * 1.02)  # breakeven + 2% de colchon
-
+            new_stop = max(stop_level, entry_price * 1.02)
             print(">>> TARGET ALCANZADO — pero setup TECNICAMENTE aun fuerte <<<")
-            print(f"  Bias intacto: SI | RSI: {last['rsi']:.1f} (<{RSI_EXTENSION_MAX} limite extension)")
+            print(f"  Bias intacto: SI | RSI: {last['rsi']:.1f} (<{RSI_EXTENSION_MAX} limite)")
             print(f"  Volumen {'sostenido/alto' if vol_sostenido else 'normal'}")
             if next_target:
-                print(f"\n  OPCION: dejar correr. Nuevo stop sugerido (breakeven+): {new_stop:.2f}")
-                print(f"  Siguiente resistencia (HVN mas amplio): {next_target:.2f}")
-                print(f"  O tomar ganancia parcial aqui y dejar el resto corriendo con el nuevo stop.")
+                print(f"\n  OPCION: dejar correr. Nuevo stop (breakeven+): {new_stop:.2f}")
+                print(f"  Siguiente resistencia: {next_target:.2f}")
             else:
-                print(f"\n  No se encontró resistencia clara mas arriba en ventana de {VP_WINDOW_EXT}d.")
-                print(f"  Considera tomar la ganancia completa aqui, o parcial con trailing stop en {new_stop:.2f}.")
-            print(f"\n  Esto es lectura tecnica, no sabe la causa (noticia/evento). Si detectaste volumen anomalo arriba,")
-            print(f"  ve que dice el mercado antes de decidir extender.")
+                print(f"\n  Sin resistencia clara arriba. Considera cerrar o trailing stop en {new_stop:.2f}.")
         else:
             razon = "RSI extendido" if not rsi_ok_extend else "bias debilitandose"
-            print(f">>> TARGET ALCANZADO — y setup ya no se ve fuerte ({razon}) <<<")
-            print(f"  Recomendacion: tomar ganancia aqui, no extender.")
+            print(f">>> TARGET ALCANZADO — setup ya no se ve fuerte ({razon}) <<<")
+            print(f"  Recomendacion: tomar ganancia aqui.")
         print("="*55)
         return
 
-    # --- Casos normales de salida ---
     razones = []
     if stop_hit: razones.append("rompió el stop")
     if rsi_ob: razones.append(f"RSI sobrecomprado ({last['rsi']:.1f})")

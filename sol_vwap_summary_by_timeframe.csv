@@ -1,0 +1,4 @@
+interval,n_trades,winrate,expectancy,equity_final
+15m,9,55.6,0.336,103.0
+1h,3,66.7,0.75,102.23
+4h,6,50.0,-0.208,98.62
