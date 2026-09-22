@@ -1,20 +1,22 @@
 """
-SOL Intradia v2 - VWAP Reclaim en multiples timeframes
-=========================================================
-Hipotesis (de la investigacion en foros/fuentes institucionales):
-precio cae bajo el VWAP de sesion, luego lo "reclama" (cierra de nuevo
-arriba) con volumen de confirmacion, DENTRO de un dia con bias diario
-alcista (EMA50>EMA200 diario) -- eso es la entrada. Salida por target,
-por perder el VWAP de nuevo (invalidacion), o por tiempo.
+SOL Intradia v3 - VWAP Reclaim: historico completo + train/test + diagnostico
+================================================================================
+Cambios vs v2:
+1. Descarga TODO el historico disponible por timeframe (desde ~2020-08-11),
+   no solo 90-365 dias. Mas oportunidades de reclaim = muestra mas grande.
+2. Split train/test explicito (igual que el swing): antes de 2024-06-01 =
+   train, despues = test out-of-sample. Reporta ambos por separado.
+3. Corre cada timeframe CON y SIN el filtro de volumen de confirmacion,
+   para diagnosticar si el filtro de volumen es el que esta matando la
+   muestra o si el setup en si es raro.
 
-Prueba esto en 3 resoluciones (15m, 1h, 4h) para comparar, en vez de
-asumir que una sola funciona. Incluye fees.
+Esto tarda mas en correr (mucho mas historico, sobre todo en 15m).
 
 Requisitos:
     pip install requests pandas numpy
 
 Uso:
-    python3 sol_vwap_intraday_backtest.py
+    python3 sol_vwap_intraday_backtest_v3.py
 """
 
 import time
@@ -26,20 +28,26 @@ SYMBOL = "SOLUSDT"
 BASE_URL = "https://api.binance.com/api/v3/klines"
 
 INTERVALS_TO_TEST = ["15m", "1h", "4h"]
-LOOKBACK_DAYS = {"15m": 90, "1h": 180, "4h": 365}   # mas historia en TFs mas altos
-DAILY_LOOKBACK_DAYS = 400  # para el filtro de bias diario (EMA50/200)
+START_DATE = "2020-08-11"           # listado aproximado de SOLUSDT en Binance
+TRAIN_TEST_SPLIT = "2024-06-01"     # mismo corte que usamos en el swing
 
-VOL_CONFIRM_RATIO = 1.2      # volumen de la vela de reclaim >= 1.2x su propio promedio movil
 VOL_AVG_WINDOW = 20
-TARGET_PCT = 0.02            # +2% desde el VWAP de reclaim
-STOP_BELOW_VWAP_PCT = 0.01   # si vuelve a cerrar 1% bajo el VWAP, invalidado
-MAX_HOLD_BARS = 12           # limite de velas en posicion (se ajusta al peso del TF)
-FEE_PCT = 0.001              # 0.1% por lado
+TARGET_PCT = 0.02
+STOP_BELOW_VWAP_PCT = 0.01
+FEE_PCT = 0.001
+
+# Dos variantes a comparar por timeframe: con filtro de volumen y sin el
+VOL_FILTER_VARIANTS = {
+    "con_filtro_vol": 1.2,   # requiere volumen >= 1.2x su promedio movil
+    "sin_filtro_vol": 0.0,   # desactivado (cualquier volumen cuenta)
+}
+
+MAX_HOLD_BARS_MAP = {"15m": 32, "1h": 12, "4h": 6}
 
 
-def fetch_klines(symbol, interval, days):
+def fetch_all_klines(symbol, interval, start_date):
+    start_time = int(pd.Timestamp(start_date).timestamp() * 1000)
     end_time = int(time.time() * 1000)
-    start_time = end_time - days * 24 * 60 * 60 * 1000
     all_rows = []
     while start_time < end_time:
         params = {"symbol": symbol, "interval": interval, "startTime": start_time, "limit": 1000}
@@ -52,7 +60,7 @@ def fetch_klines(symbol, interval, days):
         start_time = data[-1][6] + 1
         if len(data) < 1000:
             break
-        time.sleep(0.25)
+        time.sleep(0.2)
     cols = ["open_time","open","high","low","close","volume","close_time",
             "quote_asset_volume","num_trades","taker_buy_base","taker_buy_quote","ignore"]
     df = pd.DataFrame(all_rows, columns=cols)
@@ -68,7 +76,6 @@ def add_ema(df, length, col):
 
 
 def add_daily_bias(intraday_df, daily_df):
-    """Pega a cada vela intradia el bias del DIA correspondiente (EMA50>EMA200 diario)."""
     daily_df = daily_df.copy()
     daily_df["date"] = daily_df["open_time"].dt.date
     daily_df["bias_ok"] = (daily_df["close"] > daily_df["ema_slow"]) & (daily_df["ema_fast"] > daily_df["ema_slow"])
@@ -81,7 +88,6 @@ def add_daily_bias(intraday_df, daily_df):
 
 
 def add_session_vwap(df):
-    """VWAP que resetea cada dia UTC (sesion = dia calendario)."""
     df = df.copy()
     df["date"] = df["open_time"].dt.date
     typical = (df["high"] + df["low"] + df["close"]) / 3
@@ -92,7 +98,8 @@ def add_session_vwap(df):
     return df
 
 
-def backtest_vwap_reclaim(df, max_hold_bars):
+def backtest_vwap_reclaim(df, max_hold_bars, vol_confirm_ratio):
+    df = df.copy()
     df["vol_avg"] = df["volume"].rolling(VOL_AVG_WINDOW).mean()
 
     trades = []
@@ -105,7 +112,10 @@ def backtest_vwap_reclaim(df, max_hold_bars):
 
         if not in_pos:
             reclaimed = prev["close"] < prev["vwap"] and row["close"] >= row["vwap"]
-            vol_ok = not pd.isna(row["vol_avg"]) and row["vol_avg"] > 0 and (row["volume"] / row["vol_avg"]) >= VOL_CONFIRM_RATIO
+            if vol_confirm_ratio > 0:
+                vol_ok = not pd.isna(row["vol_avg"]) and row["vol_avg"] > 0 and (row["volume"] / row["vol_avg"]) >= vol_confirm_ratio
+            else:
+                vol_ok = True  # filtro desactivado
             if reclaimed and vol_ok and row["daily_bias_ok"]:
                 in_pos = True
                 entry_price = row["close"]
@@ -134,57 +144,57 @@ def backtest_vwap_reclaim(df, max_hold_bars):
     return pd.DataFrame(trades)
 
 
-def summarize(interval, trades):
-    print(f"\n{'='*55}")
-    print(f"VWAP RECLAIM - timeframe {interval}")
-    print(f"{'='*55}")
-    if trades.empty:
-        print("Sin trades generados.")
-        return None
-
-    wins = trades[trades.pnl_pct > 0]
-    winrate = len(wins)/len(trades)*100
-    exp = trades.pnl_pct.mean()
-    equity = 100
-    for p in trades.pnl_pct:
-        equity *= (1 + p/100)
-
-    print(f"Trades: {len(trades)} | Winrate: {winrate:.1f}% | Expectancy: {exp:.3f}%")
-    print(f"Equity final (100->): {equity:.2f}")
-    print(trades["reason"].value_counts())
-    return {"interval": interval, "n_trades": len(trades), "winrate": round(winrate,1),
-            "expectancy": round(exp,3), "equity_final": round(equity,2)}
+def stats(trades_df):
+    if trades_df.empty:
+        return dict(n=0, winrate=None, expectancy=None)
+    wins = trades_df[trades_df.pnl_pct > 0]
+    wr = len(wins) / len(trades_df) * 100
+    exp = trades_df.pnl_pct.mean()
+    return dict(n=len(trades_df), winrate=round(wr, 1), expectancy=round(exp, 3))
 
 
 if __name__ == "__main__":
-    print(f"Descargando velas diarias de {SYMBOL} para el filtro de bias...")
-    daily_df = fetch_klines(SYMBOL, "1d", DAILY_LOOKBACK_DAYS)
+    print(f"Descargando historico diario completo de {SYMBOL} desde {START_DATE} (para bias)...")
+    daily_df = fetch_all_klines(SYMBOL, "1d", START_DATE)
     daily_df = add_ema(daily_df, 50, "ema_fast")
     daily_df = add_ema(daily_df, 200, "ema_slow")
+    print(f"{len(daily_df)} velas diarias descargadas")
 
-    max_hold_map = {"15m": 32, "1h": 12, "4h": 6}   # ~8h, ~12h, ~24h de espera max aprox
-
+    split_date = pd.Timestamp(TRAIN_TEST_SPLIT)
     results = []
+
     for interval in INTERVALS_TO_TEST:
-        print(f"\nDescargando velas {interval} de {SYMBOL} (~{LOOKBACK_DAYS[interval]} dias)...")
-        df = fetch_klines(SYMBOL, interval, LOOKBACK_DAYS[interval])
-        print(f"{len(df)} velas descargadas")
+        print(f"\n{'='*70}\nDescargando historico COMPLETO {interval} de {SYMBOL} desde {START_DATE}...")
+        print("(esto puede tardar varios minutos en 15m, son muchas velas)")
+        df = fetch_all_klines(SYMBOL, interval, START_DATE)
+        print(f"{len(df)} velas {interval} descargadas ({df['open_time'].min().date()} a {df['open_time'].max().date()})")
 
         df = add_session_vwap(df)
         df = add_daily_bias(df, daily_df)
 
-        trades = backtest_vwap_reclaim(df, max_hold_map[interval])
-        stats = summarize(interval, trades)
-        if stats:
-            results.append(stats)
+        df_train = df[df["open_time"] < split_date].reset_index(drop=True)
+        df_test = df[df["open_time"] >= split_date].reset_index(drop=True)
+        max_hold = MAX_HOLD_BARS_MAP[interval]
 
-        trades.to_csv(f"sol_vwap_trades_{interval}.csv", index=False)
+        for variant_name, vol_ratio in VOL_FILTER_VARIANTS.items():
+            tr_trades = backtest_vwap_reclaim(df_train, max_hold, vol_ratio)
+            te_trades = backtest_vwap_reclaim(df_test, max_hold, vol_ratio)
+            tr_stats = stats(tr_trades)
+            te_stats = stats(te_trades)
 
-    if results:
-        summary_df = pd.DataFrame(results)
-        print(f"\n{'='*55}")
-        print("RESUMEN COMPARATIVO POR TIMEFRAME")
-        print(f"{'='*55}")
-        print(summary_df.to_string(index=False))
-        summary_df.to_csv("sol_vwap_summary_by_timeframe.csv", index=False)
-        print("\nGuardado: sol_vwap_summary_by_timeframe.csv + un CSV de trades por timeframe")
+            print(f"\n--- {interval} | {variant_name} ---")
+            print(f"TRAIN: n={tr_stats['n']} winrate={tr_stats['winrate']} expectancy={tr_stats['expectancy']}")
+            print(f"TEST:  n={te_stats['n']} winrate={te_stats['winrate']} expectancy={te_stats['expectancy']}")
+
+            results.append({
+                "interval": interval, "variant": variant_name,
+                "train_n": tr_stats["n"], "train_wr": tr_stats["winrate"], "train_exp": tr_stats["expectancy"],
+                "test_n": te_stats["n"], "test_wr": te_stats["winrate"], "test_exp": te_stats["expectancy"],
+            })
+
+    summary_df = pd.DataFrame(results)
+    pd.set_option("display.width", 140)
+    print(f"\n{'='*70}\nRESUMEN COMPLETO — historico total + train/test + con/sin filtro volumen\n{'='*70}")
+    print(summary_df.to_string(index=False))
+    summary_df.to_csv("sol_vwap_summary_full.csv", index=False)
+    print("\nGuardado: sol_vwap_summary_full.csv")

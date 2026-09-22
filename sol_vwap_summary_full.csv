@@ -1,0 +1,7 @@
+interval,variant,train_n,train_wr,train_exp,test_n,test_wr,test_exp
+15m,con_filtro_vol,709,47.0,-0.097,363,43.5,-0.139
+15m,sin_filtro_vol,1622,45.6,-0.101,725,44.3,-0.108
+1h,con_filtro_vol,327,45.0,-0.36,175,42.3,-0.344
+1h,sin_filtro_vol,984,45.9,-0.212,480,44.8,-0.217
+4h,con_filtro_vol,136,56.6,-0.267,78,51.3,-0.18
+4h,sin_filtro_vol,515,50.3,-0.428,257,45.9,-0.334
