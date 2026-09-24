@@ -196,5 +196,5 @@ if __name__ == "__main__":
     pd.set_option("display.width", 140)
     print(f"\n{'='*70}\nRESUMEN COMPLETO — historico total + train/test + con/sin filtro volumen\n{'='*70}")
     print(summary_df.to_string(index=False))
-    summary_df.to_csv("sol_vwap_summary_full.csv", index=False)
+    summary_df.to_csv("Data/sol_vwap_summary_full.csv", index=False)
     print("\nGuardado: sol_vwap_summary_full.csv")

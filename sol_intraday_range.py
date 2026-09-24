@@ -209,5 +209,5 @@ if __name__ == "__main__":
     total_days = len(df) // 24
     summarize(trades, breakout_skipped, no_touch, total_days)
 
-    trades.to_csv("sol_intraday_trades.csv", index=False)
+    trades.to_csv("Data/sol_intraday_trades.csv", index=False)
     print("\nGuardado: sol_intraday_trades.csv")

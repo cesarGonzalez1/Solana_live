@@ -44,8 +44,8 @@ VOL_AVG_WINDOW = 20
 VOL_SPIKE_RATIO = 1.5
 VWAP_TOLERANCE_PCT = 0.003   # 0.3% de margen sobre el VWAP para considerarlo "favorable"
 
-STATE_FILE = "sol_position_state.json"
-LOG_FILE = "sol_trade_log.csv"
+STATE_FILE = "Data/sol_position_state.json"
+LOG_FILE = "Data/sol_trade_log.csv"
 
 
 # -------------------- DATOS / INDICADORES --------------------
